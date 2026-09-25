@@ -19,7 +19,6 @@ SYMBOLS = [
 
 TIMEFRAME = "4h"
 OUTPUTSIZE = 5000
-
 DEV_SPLIT = 0.70
 
 
@@ -54,12 +53,7 @@ def get_data(symbol):
         utc=True
     )
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close"
-    ]:
+    for column in ["open", "high", "low", "close"]:
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce"
@@ -113,29 +107,24 @@ def calculate_indicators(df):
 
 
 def check_signal(df, i):
+
     if i < 1:
         return None
 
-    previous = df.iloc[i]
+    previous = df.iloc[i - 1]
     current = df.iloc[i]
-
-    previous_candle = df.iloc[i - 1]
 
     ema50 = current["ema50"]
     ema200 = current["ema200"]
     atr = current["atr"]
     adx = current["adx"]
 
-    if pd.isna(ema50):
-        return None
-
-    if pd.isna(ema200):
-        return None
-
-    if pd.isna(atr):
-        return None
-
-    if pd.isna(adx):
+    if (
+        pd.isna(ema50)
+        or pd.isna(ema200)
+        or pd.isna(atr)
+        or pd.isna(adx)
+    ):
         return None
 
     # =========================
@@ -145,23 +134,20 @@ def check_signal(df, i):
     if (
         ema50 > ema200
         and adx > 20
-        and previous_candle["close"] > previous_candle["ema50"]
+        and previous["close"] > previous["ema50"]
         and current["low"] <= ema50
     ):
+
         entry = ema50
-
-        sl = entry - (2 * atr)
-
-        tp1 = entry + (1.5 * atr)
-
-        tp2 = entry + (3 * atr)
 
         return {
             "direction": "BUY",
             "entry": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
+            "sl": entry - (2 * atr),
+            "tp1": entry + (1.5 * atr),
+            "tp2": entry + (3 * atr),
+            "adx": adx,
+            "signal_index": i,
         }
 
     # =========================
@@ -171,33 +157,27 @@ def check_signal(df, i):
     if (
         ema50 < ema200
         and adx > 20
-        and previous_candle["close"] < previous_candle["ema50"]
+        and previous["close"] < previous["ema50"]
         and current["high"] >= ema50
     ):
+
         entry = ema50
-
-        sl = entry + (2 * atr)
-
-        tp1 = entry - (1.5 * atr)
-
-        tp2 = entry - (3 * atr)
 
         return {
             "direction": "SELL",
             "entry": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
+            "sl": entry + (2 * atr),
+            "tp1": entry - (1.5 * atr),
+            "tp2": entry - (3 * atr),
+            "adx": adx,
+            "signal_index": i,
         }
 
     return None
 
 
-def find_entry_and_manage_trade(
-    df,
-    signal_index,
-    signal
-):
+def manage_trade(df, signal):
+
     direction = signal["direction"]
 
     entry = signal["entry"]
@@ -205,12 +185,13 @@ def find_entry_and_manage_trade(
     tp1 = signal["tp1"]
     tp2 = signal["tp2"]
 
-    entry_index = None
+    signal_index = signal["signal_index"]
 
-    # ==================================================
-    # STEP 1
-    # WAIT FOR THE LIMIT ORDER TO ACTUALLY FILL
-    # ==================================================
+    # ==========================================
+    # STEP 1 — WAIT FOR ACTUAL ENTRY
+    # ==========================================
+
+    entry_index = None
 
     for j in range(
         signal_index + 1,
@@ -219,32 +200,30 @@ def find_entry_and_manage_trade(
 
         candle = df.iloc[j]
 
-        high = candle["high"]
-        low = candle["low"]
-
         if direction == "BUY":
 
-            if low <= entry:
+            if candle["low"] <= entry:
                 entry_index = j
                 break
 
         else:
 
-            if high >= entry:
+            if candle["high"] >= entry:
                 entry_index = j
                 break
 
-    # Entry was never reached.
     if entry_index is None:
+
         return {
             "result": "NO_ENTRY",
             "r": 0.0,
+            "entry_index": None,
+            "exit_index": None,
         }
 
-    # ==================================================
-    # STEP 2
-    # MANAGE THE TRADE AFTER ENTRY
-    # ==================================================
+    # ==========================================
+    # STEP 2 — MANAGE AFTER ENTRY
+    # ==========================================
 
     tp1_hit = False
 
@@ -258,157 +237,159 @@ def find_entry_and_manage_trade(
         high = candle["high"]
         low = candle["low"]
 
-        # ==============================================
-        # BUY TRADE
-        # ==============================================
+        # ======================================
+        # BUY
+        # ======================================
 
         if direction == "BUY":
 
             if not tp1_hit:
 
                 sl_hit = low <= sl
+                tp1_hit_this_candle = high >= tp1
 
-                tp1_hit_this_candle = (
-                    high >= tp1
-                )
+                if (
+                    sl_hit
+                    and tp1_hit_this_candle
+                ):
 
-                # Conservative handling when both
-                # SL and TP1 occur inside one candle.
-                if sl_hit and tp1_hit_this_candle:
                     return {
                         "result": "SL",
                         "r": -1.0,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
                 if sl_hit:
+
                     return {
                         "result": "SL",
                         "r": -1.0,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
                 if tp1_hit_this_candle:
+
                     tp1_hit = True
                     continue
-
-            # ==========================================
-            # AFTER TP1
-            # Remaining 50% moves to breakeven.
-            # ==========================================
 
             if tp1_hit:
 
                 breakeven_hit = low <= entry
-
                 tp2_hit = high >= tp2
 
-                # Conservative:
-                # if BE and TP2 happen in same candle,
-                # count BE.
                 if (
                     breakeven_hit
                     and tp2_hit
                 ):
+
                     return {
                         "result": "TP1+BE",
                         "r": 0.375,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
                 if breakeven_hit:
+
                     return {
                         "result": "TP1+BE",
                         "r": 0.375,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
                 if tp2_hit:
+
                     return {
                         "result": "TP2",
                         "r": 1.125,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
-        # ==============================================
-        # SELL TRADE
-        # ==============================================
+        # ======================================
+        # SELL
+        # ======================================
 
         else:
 
             if not tp1_hit:
 
                 sl_hit = high >= sl
+                tp1_hit_this_candle = low <= tp1
 
-                tp1_hit_this_candle = (
-                    low <= tp1
-                )
+                if (
+                    sl_hit
+                    and tp1_hit_this_candle
+                ):
 
-                if sl_hit and tp1_hit_this_candle:
                     return {
                         "result": "SL",
                         "r": -1.0,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
                 if sl_hit:
+
                     return {
                         "result": "SL",
                         "r": -1.0,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
                 if tp1_hit_this_candle:
+
                     tp1_hit = True
                     continue
-
-            # ==========================================
-            # AFTER TP1
-            # Remaining 50% moves to breakeven.
-            # ==========================================
 
             if tp1_hit:
 
                 breakeven_hit = high >= entry
-
                 tp2_hit = low <= tp2
 
                 if (
                     breakeven_hit
                     and tp2_hit
                 ):
+
                     return {
                         "result": "TP1+BE",
                         "r": 0.375,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
                 if breakeven_hit:
+
                     return {
                         "result": "TP1+BE",
                         "r": 0.375,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
                 if tp2_hit:
+
                     return {
                         "result": "TP2",
                         "r": 1.125,
                         "entry_index": entry_index,
+                        "exit_index": j,
                     }
 
     return {
         "result": "OPEN",
         "r": 0.0,
         "entry_index": entry_index,
+        "exit_index": None,
     }
 
 
-def run_period(
-    df,
-    start,
-    end
-):
+def run_period(df, symbol, start, end):
 
     results = []
 
@@ -422,27 +403,37 @@ def run_period(
         )
 
         if signal is None:
+
             i += 1
             continue
 
-        trade = find_entry_and_manage_trade(
+        trade = manage_trade(
             df,
-            i,
             signal
         )
 
+        trade["symbol"] = symbol
+        trade["direction"] = signal["direction"]
+        trade["adx"] = signal["adx"]
+
         results.append(trade)
 
-        # If the trade entered and finished,
-        # don't allow overlapping trades.
-        if "entry_index" in trade:
-            entry_index = trade["entry_index"]
+        # ======================================
+        # IMPORTANT:
+        # Do not allow another trade while
+        # this trade is still active.
+        # ======================================
 
-            i = max(
-                i + 1,
-                entry_index
-            )
+        if trade["exit_index"] is not None:
+
+            i = trade["exit_index"] + 1
+
+        elif trade["entry_index"] is not None:
+
+            i = len(df)
+
         else:
+
             i += 1
 
     return results
@@ -450,84 +441,65 @@ def run_period(
 
 def summarize(results):
 
-    total_signals = len(results)
-
-    no_entry = sum(
-        1
-        for r in results
-        if r["result"] == "NO_ENTRY"
-    )
+    resolved = [
+        r for r in results
+        if r["result"]
+        in ["TP2", "TP1+BE", "SL"]
+    ]
 
     tp2 = sum(
-        1
-        for r in results
-        if r["result"] == "TP2"
+        r["result"] == "TP2"
+        for r in resolved
     )
 
     tp1_be = sum(
-        1
-        for r in results
-        if r["result"] == "TP1+BE"
+        r["result"] == "TP1+BE"
+        for r in resolved
     )
 
     sl = sum(
-        1
+        r["result"] == "SL"
+        for r in resolved
+    )
+
+    no_entry = sum(
+        r["result"] == "NO_ENTRY"
         for r in results
-        if r["result"] == "SL"
     )
 
-    open_trades = sum(
-        1
-        for r in results
-        if r["result"] == "OPEN"
-    )
-
-    resolved = (
-        tp2
-        + tp1_be
-        + sl
-    )
-
-    wins = (
-        tp2
-        + tp1_be
-    )
+    wins = tp2 + tp1_be
 
     win_rate = (
-        wins / resolved * 100
-        if resolved > 0
+        wins / len(resolved) * 100
+        if resolved
         else 0
     )
 
     total_r = sum(
         r["r"]
-        for r in results
+        for r in resolved
     )
 
     average_r = (
-        total_r / resolved
-        if resolved > 0
+        total_r / len(resolved)
+        if resolved
         else 0
     )
 
     return {
-        "signals": total_signals,
+        "signals": len(results),
         "no_entry": no_entry,
         "tp2": tp2,
         "tp1_be": tp1_be,
         "sl": sl,
-        "open": open_trades,
-        "resolved": resolved,
+        "resolved": len(resolved),
         "win_rate": win_rate,
         "total_r": total_r,
         "average_r": average_r,
     }
 
 
-def print_summary(
-    title,
-    summary
-):
+def print_summary(title, summary):
 
     print()
     print("=" * 60)
@@ -560,11 +532,6 @@ def print_summary(
     )
 
     print(
-        f"Open/unresolved: "
-        f"{summary['open']}"
-    )
-
-    print(
         f"Resolved trades: "
         f"{summary['resolved']}"
     )
@@ -585,19 +552,161 @@ def print_summary(
     )
 
 
+def print_diagnostic(title, results):
+
+    print()
+    print("=" * 60)
+    print(title)
+    print("=" * 60)
+
+    resolved = [
+        r for r in results
+        if r["result"]
+        in ["TP2", "TP1+BE", "SL"]
+    ]
+
+    for symbol in SYMBOLS:
+
+        symbol_trades = [
+            r for r in resolved
+            if r["symbol"] == symbol
+        ]
+
+        if not symbol_trades:
+            continue
+
+        buys = [
+            r for r in symbol_trades
+            if r["direction"] == "BUY"
+        ]
+
+        sells = [
+            r for r in symbol_trades
+            if r["direction"] == "SELL"
+        ]
+
+        def direction_stats(trades):
+
+            tp2 = sum(
+                r["result"] == "TP2"
+                for r in trades
+            )
+
+            tp1_be = sum(
+                r["result"] == "TP1+BE"
+                for r in trades
+            )
+
+            sl = sum(
+                r["result"] == "SL"
+                for r in trades
+            )
+
+            total_r = sum(
+                r["r"]
+                for r in trades
+            )
+
+            return (
+                len(trades),
+                tp2,
+                tp1_be,
+                sl,
+                total_r
+            )
+
+        b = direction_stats(buys)
+        s = direction_stats(sells)
+
+        print()
+        print(symbol)
+
+        print(
+            f"  BUY  | "
+            f"Trades: {b[0]} | "
+            f"TP2: {b[1]} | "
+            f"TP1+BE: {b[2]} | "
+            f"SL: {b[3]} | "
+            f"R: {b[4]:.2f}"
+        )
+
+        print(
+            f"  SELL | "
+            f"Trades: {s[0]} | "
+            f"TP2: {s[1]} | "
+            f"TP1+BE: {s[2]} | "
+            f"SL: {s[3]} | "
+            f"R: {s[4]:.2f}"
+        )
+
+    # ==========================================
+    # ADX BREAKDOWN
+    # ==========================================
+
+    print()
+    print("=" * 60)
+    print("ADX BREAKDOWN — OUT-OF-SAMPLE")
+    print("=" * 60)
+
+    adx_ranges = [
+        ("20-25", 20, 25),
+        ("25-30", 25, 30),
+        ("30-40", 30, 40),
+        ("40+", 40, float("inf")),
+    ]
+
+    for label, low_adx, high_adx in adx_ranges:
+
+        group = [
+            r for r in resolved
+            if low_adx <= r["adx"] < high_adx
+        ]
+
+        if not group:
+            print(
+                f"ADX {label}: 0 trades"
+            )
+            continue
+
+        wins = sum(
+            r["result"]
+            in ["TP2", "TP1+BE"]
+            for r in group
+        )
+
+        total_r = sum(
+            r["r"]
+            for r in group
+        )
+
+        win_rate = (
+            wins / len(group) * 100
+        )
+
+        print(
+            f"ADX {label}: "
+            f"{len(group)} trades | "
+            f"Win rate: {win_rate:.2f}% | "
+            f"R: {total_r:.2f}"
+        )
+
+
 def main():
 
     print()
     print("APEX MARKET SIGNALS")
-    print("ENTRY-FILL AUDIT BACKTEST")
+    print("STRATEGY DIAGNOSTIC BACKTEST")
     print("Trend Following Pullback Strategy")
     print("Timeframe: 4H")
+    print("Historical candles: 5000")
     print("Development: 70%")
     print("Out-of-sample: 30%")
     print()
     print(
-        "IMPORTANT: A signal is only counted as a trade "
-        "after the EMA50 limit entry is actually reached."
+        "No strategy rules are being changed."
+    )
+    print(
+        "Trades cannot overlap."
     )
     print()
 
@@ -632,22 +741,16 @@ def main():
 
         development = run_period(
             df,
+            symbol,
             0,
             split_index
         )
 
         out_of_sample = run_period(
             df,
+            symbol,
             split_index,
             len(df)
-        )
-
-        dev_summary = summarize(
-            development
-        )
-
-        oos_summary = summarize(
-            out_of_sample
         )
 
         all_development.extend(
@@ -658,21 +761,27 @@ def main():
             out_of_sample
         )
 
+        dev = summarize(
+            development
+        )
+
+        oos = summarize(
+            out_of_sample
+        )
+
         print()
         print(symbol)
 
         print(
             f"Development: "
-            f"{dev_summary['signals']} signals | "
-            f"{dev_summary['no_entry']} no-entry | "
-            f"{dev_summary['total_r']:.2f}R"
+            f"{dev['signals']} signals | "
+            f"{dev['total_r']:.2f}R"
         )
 
         print(
             f"Out-of-sample: "
-            f"{oos_summary['signals']} signals | "
-            f"{oos_summary['no_entry']} no-entry | "
-            f"{oos_summary['total_r']:.2f}R"
+            f"{oos['signals']} signals | "
+            f"{oos['total_r']:.2f}R"
         )
 
     print_summary(
@@ -685,9 +794,14 @@ def main():
         summarize(all_oos)
     )
 
+    print_diagnostic(
+        "DIRECTION BREAKDOWN — OUT-OF-SAMPLE",
+        all_oos
+    )
+
     print()
     print("=" * 60)
-    print("ENTRY-FILL AUDIT COMPLETE")
+    print("DIAGNOSTIC TEST COMPLETE")
     print("=" * 60)
 
 
