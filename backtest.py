@@ -56,7 +56,7 @@ def prepare_data(df):
 
 
 # ============================================================
-# ORIGINAL SIGNAL RULES — FROZEN
+# SIGNAL RULES — FROZEN
 # ============================================================
 
 def check_signal(df, i):
@@ -75,10 +75,7 @@ def check_signal(df, i):
     ):
         return None
 
-    # --------------------------------------------------------
     # BUY LIMIT
-    # --------------------------------------------------------
-
     if (
         current["ema50"] > current["ema200"]
         and current["adx"] > ADX_MIN
@@ -99,10 +96,7 @@ def check_signal(df, i):
             "adx": current["adx"],
         }
 
-    # --------------------------------------------------------
     # SELL LIMIT
-    # --------------------------------------------------------
-
     if (
         current["ema50"] < current["ema200"]
         and current["adx"] > ADX_MIN
@@ -129,14 +123,22 @@ def check_signal(df, i):
 # ============================================================
 # TRADE SIMULATION
 #
-# IMPORTANT:
-# The signal candle itself can NEVER fill the limit order.
-# Entry starts from the NEXT candle.
+# end_index is EXCLUSIVE.
 #
-# Trade management continues through the available dataset.
+# Development trades:
+#   signal, entry and trade management must all finish
+#   before the OOS boundary.
+#
+# OOS trades:
+#   may continue until the historical dataset ends.
 # ============================================================
 
-def simulate_trade(df, signal, entry_index):
+def simulate_trade(
+    df,
+    signal,
+    entry_index,
+    end_index
+):
 
     direction = signal["direction"]
 
@@ -147,7 +149,7 @@ def simulate_trade(df, signal, entry_index):
 
     tp1_hit = False
 
-    for j in range(entry_index, len(df)):
+    for j in range(entry_index, end_index):
 
         candle = df.iloc[j]
 
@@ -166,7 +168,7 @@ def simulate_trade(df, signal, entry_index):
                 tp1_hit_now = high >= tp1
 
                 # Conservative same-candle assumption:
-                # SL is considered hit first.
+                # SL is considered first.
                 if sl_hit and tp1_hit_now:
                     return {
                         "result": "SL",
@@ -190,7 +192,7 @@ def simulate_trade(df, signal, entry_index):
                 tp1_hit_now = low <= tp1
 
                 # Conservative same-candle assumption:
-                # SL is considered hit first.
+                # SL is considered first.
                 if sl_hit and tp1_hit_now:
                     return {
                         "result": "SL",
@@ -210,9 +212,6 @@ def simulate_trade(df, signal, entry_index):
 
         # ----------------------------------------------------
         # AFTER TP1
-        #
-        # 50% was closed at TP1.
-        # Remaining 50% moves SL to breakeven.
         # ----------------------------------------------------
 
         if tp1_hit:
@@ -223,7 +222,7 @@ def simulate_trade(df, signal, entry_index):
                 tp2_hit = high >= tp2
 
                 # Conservative same-candle assumption:
-                # BE is considered hit first.
+                # BE is considered first.
                 if be_hit and tp2_hit:
                     return {
                         "result": "TP1+BE",
@@ -251,7 +250,7 @@ def simulate_trade(df, signal, entry_index):
                 tp2_hit = low <= tp2
 
                 # Conservative same-candle assumption:
-                # BE is considered hit first.
+                # BE is considered first.
                 if be_hit and tp2_hit:
                     return {
                         "result": "TP1+BE",
@@ -273,22 +272,19 @@ def simulate_trade(df, signal, entry_index):
                         "exit_index": j,
                     }
 
-    # Trade was entered but never reached SL, TP1, or TP2
-    # before the historical dataset ended.
     return None
 
 
 # ============================================================
 # PERIOD TEST
-#
-# Signals are generated only inside the requested period.
-# An entry must occur AFTER the signal candle.
-#
-# Once entered, the trade is allowed to continue through
-# the remaining historical candles.
 # ============================================================
 
-def run_period(df, start_index, signal_end_index):
+def run_period(
+    df,
+    start_index,
+    signal_end_index,
+    trade_end_index
+):
 
     results = []
 
@@ -305,12 +301,15 @@ def run_period(df, start_index, signal_end_index):
         signal_index = i
 
         # ----------------------------------------------------
-        # LIMIT ENTRY MUST HAPPEN AFTER SIGNAL CANDLE
+        # ENTRY MUST OCCUR AFTER SIGNAL CANDLE
         # ----------------------------------------------------
 
         entry_index = None
 
-        for j in range(signal_index + 1, len(df)):
+        for j in range(
+            signal_index + 1,
+            trade_end_index
+        ):
 
             candle = df.iloc[j]
 
@@ -353,7 +352,8 @@ def run_period(df, start_index, signal_end_index):
         trade = simulate_trade(
             df,
             signal,
-            entry_index
+            entry_index,
+            trade_end_index
         )
 
         if trade is None:
@@ -367,8 +367,8 @@ def run_period(df, start_index, signal_end_index):
                 "r": 0.0,
             })
 
-            # No later signal can be considered while this
-            # trade remains open.
+            # Stop because an unresolved trade means no
+            # overlapping trades are allowed.
             break
 
         results.append({
@@ -533,7 +533,7 @@ def download_data(symbol):
 print()
 print("=" * 60)
 print("APEX MARKET SIGNALS")
-print("BACKTEST MECHANICS AUDIT")
+print("CLEAN 70/30 BACKTEST AUDIT")
 print("=" * 60)
 print("Trend Following Pullback Strategy")
 print("Timeframe: 4H")
@@ -546,8 +546,9 @@ print("NO ADX CHANGES.")
 print("NO PAIR REMOVALS.")
 print("NO NEW FILTERS.")
 print("NO OVERLAPPING TRADES.")
-print("LIMIT ENTRY CANNOT FILL ON SIGNAL CANDLE.")
-print("TRADE MANAGEMENT CONTINUES TO DATASET END.")
+print()
+print("DEVELOPMENT TRADES CANNOT CROSS INTO OOS.")
+print("OOS TRADES MAY CONTINUE TO DATASET END.")
 print("=" * 60)
 
 combined_development = []
@@ -565,6 +566,12 @@ for symbol in SYMBOLS:
     if df is None:
         continue
 
+    df = prepare_data(df)
+
+    split_index = int(
+        len(df) * DEVELOPMENT_RATIO
+    )
+
     print(
         f"Data candles: {len(df)}"
     )
@@ -577,41 +584,36 @@ for symbol in SYMBOLS:
         f"Data end: {df['datetime'].iloc[-1]}"
     )
 
-    df = prepare_data(df)
-
-    split_index = int(
-        len(df) * DEVELOPMENT_RATIO
-    )
-
     print(
         f"Development end index: {split_index}"
     )
 
-    print(
-        f"OOS start index: {split_index}"
-    )
-
     # --------------------------------------------------------
     # DEVELOPMENT
+    #
+    # Signals, entries and trade exits MUST all occur before
+    # the OOS boundary.
     # --------------------------------------------------------
 
     development_results = run_period(
         df,
         1,
+        split_index,
         split_index
     )
 
     # --------------------------------------------------------
     # OOS
     #
-    # Signals are generated only from the OOS section.
-    # Once an OOS trade is entered, it may continue through
-    # the remaining historical dataset.
+    # Signals start at the OOS boundary.
+    # Entries and trade management can continue until the
+    # historical dataset ends.
     # --------------------------------------------------------
 
     oos_results = run_period(
         df,
         split_index,
+        len(df),
         len(df)
     )
 
@@ -650,7 +652,7 @@ for symbol in SYMBOLS:
 
 
 # ============================================================
-# COMBINED DEVELOPMENT
+# DEVELOPMENT RESULTS
 # ============================================================
 
 dev = summary(
@@ -705,7 +707,7 @@ print(
 
 
 # ============================================================
-# COMBINED OOS
+# OOS RESULTS
 # ============================================================
 
 oos = summary(
@@ -760,19 +762,14 @@ print(
 
 
 # ============================================================
-# FINAL AUDIT
+# FINAL
 # ============================================================
 
 print()
 print("=" * 60)
-print("BACKTEST MECHANICS AUDIT COMPLETE")
+print("CLEAN 70/30 BACKTEST AUDIT COMPLETE")
 print("=" * 60)
 print()
-print("IMPORTANT:")
-print("This run does NOT modify the strategy.")
-print("This run does NOT modify bot.py.")
-print("This run does NOT modify the live workflow.")
-print()
-print("The result will be used only to establish")
-print("one authoritative backtest baseline.")
+print("STRATEGY RULES WERE NOT CHANGED.")
+print("ONLY THE DEVELOPMENT/OOS TRADE BOUNDARY WAS ENFORCED.")
 print("=" * 60)
