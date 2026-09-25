@@ -6,33 +6,7 @@ from ta.trend import EMAIndicator, ADXIndicator
 from ta.volatility import AverageTrueRange
 
 
-# ============================================================
-# APEX MARKET SIGNALS — REALISTIC BACKTEST
-# ============================================================
-#
-# Strategy:
-# Trend Following Pullback
-#
-# Timeframe:
-# 4H
-#
-# Indicators:
-# EMA 50
-# EMA 200
-# ATR 14
-# ADX 14
-#
-# Trade management:
-# 50% at TP1
-# 50% at TP2
-# Move remaining SL to breakeven after TP1
-#
-# ============================================================
-
-
 API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
-
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 
 SYMBOLS = [
     "EUR/USD",
@@ -44,789 +18,480 @@ SYMBOLS = [
 ]
 
 TIMEFRAME = "4h"
+OUTPUTSIZE = 1000
 
-OUTPUT_SIZE = 1000
+DEV_SPLIT = 0.70
+
+INITIAL_RISK = 1.0
+
+TP1_R = 0.75
+TP2_R = 1.50
 
 
-# ============================================================
-# GET HISTORICAL DATA
-# ============================================================
-
-def get_historical_data(symbol):
+def get_data(symbol):
+    url = "https://api.twelvedata.com/time_series"
 
     params = {
         "symbol": symbol,
         "interval": TIMEFRAME,
-        "outputsize": OUTPUT_SIZE,
+        "outputsize": OUTPUTSIZE,
+        "apikey": API_KEY,
         "order": "asc",
         "timezone": "UTC",
-        "apikey": API_KEY,
     }
 
-    response = requests.get(
-        TWELVE_DATA_URL,
-        params=params,
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
+    response = requests.get(url, params=params, timeout=30)
     data = response.json()
 
-    if data.get("status") == "error":
-        raise RuntimeError(
-            f"Twelve Data error for {symbol}: "
-            f"{data.get('message', 'Unknown error')}"
-        )
-
     if "values" not in data:
-        raise RuntimeError(
-            f"No historical data returned for {symbol}."
-        )
+        print(f"{symbol}: ERROR - {data}")
+        return None
 
     df = pd.DataFrame(data["values"])
 
-    df["datetime"] = pd.to_datetime(
-        df["datetime"],
-        utc=True,
-    )
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-    ]:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
+    for column in ["open", "high", "low", "close"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    df = df.sort_values("datetime").reset_index(drop=True)
 
     df = df.dropna(
-        subset=[
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
-    )
-
-    df = df.sort_values("datetime")
-    df = df.reset_index(drop=True)
+        subset=["datetime", "open", "high", "low", "close"]
+    ).reset_index(drop=True)
 
     return df
 
 
-# ============================================================
-# ADD INDICATORS
-# ============================================================
-
-def add_indicators(df):
-
+def calculate_indicators(df):
     df = df.copy()
 
     df["ema50"] = EMAIndicator(
         close=df["close"],
-        window=50,
+        window=50
     ).ema_indicator()
 
     df["ema200"] = EMAIndicator(
         close=df["close"],
-        window=200,
+        window=200
     ).ema_indicator()
 
     df["atr"] = AverageTrueRange(
         high=df["high"],
         low=df["low"],
         close=df["close"],
-        window=14,
+        window=14
     ).average_true_range()
 
     df["adx"] = ADXIndicator(
         high=df["high"],
         low=df["low"],
         close=df["close"],
-        window=14,
+        window=14
     ).adx()
 
-    return df
+    return df.dropna().reset_index(drop=True)
 
 
-# ============================================================
-# SIMULATE TRADE
-# ============================================================
+def check_signal(df, i):
+    if i < 1:
+        return None
 
-def simulate_trade(
-    df,
-    start_index,
-    entry,
-    stop_loss,
-    tp1,
-    tp2,
-    direction,
-):
+    previous = df.iloc[i - 1]
+    current = df.iloc[i]
 
-    entry_filled = False
+    ema50 = current["ema50"]
+    ema200 = current["ema200"]
+    atr = current["atr"]
+    adx = current["adx"]
+
+    if pd.isna(ema50) or pd.isna(ema200):
+        return None
+
+    if pd.isna(atr) or pd.isna(adx):
+        return None
+
+    # -------------------------
+    # BUY LIMIT
+    # -------------------------
+
+    if (
+        ema50 > ema200
+        and adx > 20
+        and previous["close"] > previous["ema50"]
+        and current["low"] <= ema50
+    ):
+        entry = ema50
+        sl = entry - (2 * atr)
+        tp1 = entry + (1.5 * atr)
+        tp2 = entry + (3 * atr)
+
+        return {
+            "direction": "BUY",
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+        }
+
+    # -------------------------
+    # SELL LIMIT
+    # -------------------------
+
+    if (
+        ema50 < ema200
+        and adx > 20
+        and previous["close"] < previous["ema50"]
+        and current["high"] >= ema50
+    ):
+        entry = ema50
+        sl = entry + (2 * atr)
+        tp1 = entry - (1.5 * atr)
+        tp2 = entry - (3 * atr)
+
+        return {
+            "direction": "SELL",
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+        }
+
+    return None
+
+
+def backtest_trade(df, start_index, signal):
+    direction = signal["direction"]
+
+    entry = signal["entry"]
+    sl = signal["sl"]
+    tp1 = signal["tp1"]
+    tp2 = signal["tp2"]
+
     tp1_hit = False
 
-    # --------------------------------------------------------
-    # BEFORE TP1
-    # --------------------------------------------------------
-
-    for j in range(
-        start_index,
-        len(df),
-    ):
+    # The signal candle has already closed.
+    # Entry is therefore evaluated from the NEXT candle.
+    for j in range(start_index, len(df)):
 
         candle = df.iloc[j]
 
-        high = float(candle["high"])
-        low = float(candle["low"])
-
-        # ====================================================
-        # BUY
-        # ====================================================
+        high = candle["high"]
+        low = candle["low"]
 
         if direction == "BUY":
 
-            # -----------------------------------------------
-            # Wait for limit entry
-            # -----------------------------------------------
-
-            if not entry_filled:
-
-                if low <= entry <= high:
-                    entry_filled = True
-                else:
-                    continue
-
-            # -----------------------------------------------
-            # Entry has been filled
-            #
-            # Conservative rule:
-            # If SL and TP1 are both touched in the same
-            # candle before TP1 was previously confirmed,
-            # assume SL happened first.
-            # -----------------------------------------------
-
-            hit_sl = low <= stop_loss
-            hit_tp1 = high >= tp1
-
-            if hit_sl and hit_tp1:
-
-                return {
-                    "direction": direction,
-                    "entry": entry,
-                    "stop_loss": stop_loss,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "result": "SL",
-                    "r_multiple": -1.0,
-                }
-
-            if hit_sl:
-
-                return {
-                    "direction": direction,
-                    "entry": entry,
-                    "stop_loss": stop_loss,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "result": "SL",
-                    "r_multiple": -1.0,
-                }
-
-            if hit_tp1:
-
-                tp1_hit = True
-
-                # 50% closes at TP1.
-                # 0.5 x 0.75R = +0.375R
-
-                tp1_profit = 0.375
-
-                # Continue with the remaining 50%.
-                #
-                # Its new stop is breakeven = entry.
-                #
-                for k in range(
-                    j + 1,
-                    len(df),
-                ):
-
-                    next_candle = df.iloc[k]
-
-                    next_high = float(
-                        next_candle["high"]
-                    )
-
-                    next_low = float(
-                        next_candle["low"]
-                    )
-
-                    hit_breakeven = (
-                        next_low <= entry
-                    )
-
-                    hit_tp2 = (
-                        next_high >= tp2
-                    )
-
-                    # Conservative rule:
-                    # If both TP2 and breakeven are touched
-                    # in the same candle, assume breakeven
-                    # happened first.
-                    if hit_breakeven and hit_tp2:
-
-                        return {
-                            "direction": direction,
-                            "entry": entry,
-                            "stop_loss": stop_loss,
-                            "tp1": tp1,
-                            "tp2": tp2,
-                            "result": "TP1_BE",
-                            "r_multiple": tp1_profit,
-                        }
-
-                    if hit_breakeven:
-
-                        return {
-                            "direction": direction,
-                            "entry": entry,
-                            "stop_loss": stop_loss,
-                            "tp1": tp1,
-                            "tp2": tp2,
-                            "result": "TP1_BE",
-                            "r_multiple": tp1_profit,
-                        }
-
-                    if hit_tp2:
-
-                        # Remaining 50% gets 1.5R.
-                        # 0.5 x 1.5R = +0.75R
-                        #
-                        # Total:
-                        # +0.375R + 0.75R = +1.125R
-
-                        return {
-                            "direction": direction,
-                            "entry": entry,
-                            "stop_loss": stop_loss,
-                            "tp1": tp1,
-                            "tp2": tp2,
-                            "result": "TP2",
-                            "r_multiple": 1.125,
-                        }
-
-                return {
-                    "direction": direction,
-                    "entry": entry,
-                    "stop_loss": stop_loss,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "result": "OPEN",
-                    "r_multiple": tp1_profit,
-                }
-
-        # ====================================================
-        # SELL
-        # ====================================================
-
-        if direction == "SELL":
-
-            # -----------------------------------------------
-            # Wait for limit entry
-            # -----------------------------------------------
-
-            if not entry_filled:
-
-                if low <= entry <= high:
-                    entry_filled = True
-                else:
-                    continue
-
-            # -----------------------------------------------
-            # Entry has been filled
-            # -----------------------------------------------
-
-            hit_sl = high >= stop_loss
-            hit_tp1 = low <= tp1
-
-            # Conservative rule:
+            # Before TP1:
             # If SL and TP1 occur in the same candle,
-            # assume SL happened first.
-            if hit_sl and hit_tp1:
+            # use the conservative assumption that SL happened first.
+            if not tp1_hit:
 
-                return {
-                    "direction": direction,
-                    "entry": entry,
-                    "stop_loss": stop_loss,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "result": "SL",
-                    "r_multiple": -1.0,
-                }
+                sl_hit = low <= sl
+                tp1_hit_this_candle = high >= tp1
 
-            if hit_sl:
+                if sl_hit and tp1_hit_this_candle:
+                    return {
+                        "result": "SL",
+                        "r": -1.0,
+                    }
 
-                return {
-                    "direction": direction,
-                    "entry": entry,
-                    "stop_loss": stop_loss,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "result": "SL",
-                    "r_multiple": -1.0,
-                }
+                if sl_hit:
+                    return {
+                        "result": "SL",
+                        "r": -1.0,
+                    }
 
-            if hit_tp1:
+                if tp1_hit_this_candle:
+                    tp1_hit = True
+                    continue
 
-                tp1_hit = True
+            # After TP1:
+            # Remaining 50% has SL moved to breakeven.
+            if tp1_hit:
 
-                # 50% closes at TP1.
-                # +0.375R
+                breakeven_hit = low <= entry
+                tp2_hit = high >= tp2
 
-                tp1_profit = 0.375
+                # Conservative assumption:
+                # if both happen in same candle,
+                # count breakeven before TP2.
+                if breakeven_hit and tp2_hit:
+                    return {
+                        "result": "TP1+BE",
+                        "r": 0.375,
+                    }
 
-                # Remaining 50%:
-                # Stop moves to breakeven.
+                if breakeven_hit:
+                    return {
+                        "result": "TP1+BE",
+                        "r": 0.375,
+                    }
 
-                for k in range(
-                    j + 1,
-                    len(df),
-                ):
+                if tp2_hit:
+                    return {
+                        "result": "TP2",
+                        "r": 1.125,
+                    }
 
-                    next_candle = df.iloc[k]
+        else:
 
-                    next_high = float(
-                        next_candle["high"]
-                    )
+            # SELL
+            if not tp1_hit:
 
-                    next_low = float(
-                        next_candle["low"]
-                    )
+                sl_hit = high >= sl
+                tp1_hit_this_candle = low <= tp1
 
-                    hit_breakeven = (
-                        next_high >= entry
-                    )
+                if sl_hit and tp1_hit_this_candle:
+                    return {
+                        "result": "SL",
+                        "r": -1.0,
+                    }
 
-                    hit_tp2 = (
-                        next_low <= tp2
-                    )
+                if sl_hit:
+                    return {
+                        "result": "SL",
+                        "r": -1.0,
+                    }
 
-                    # Conservative rule:
-                    # If TP2 and breakeven happen in the
-                    # same candle, assume breakeven first.
-                    if hit_breakeven and hit_tp2:
+                if tp1_hit_this_candle:
+                    tp1_hit = True
+                    continue
 
-                        return {
-                            "direction": direction,
-                            "entry": entry,
-                            "stop_loss": stop_loss,
-                            "tp1": tp1,
-                            "tp2": tp2,
-                            "result": "TP1_BE",
-                            "r_multiple": tp1_profit,
-                        }
+            # After TP1:
+            # Remaining 50% moves to breakeven.
+            if tp1_hit:
 
-                    if hit_breakeven:
+                breakeven_hit = high >= entry
+                tp2_hit = low <= tp2
 
-                        return {
-                            "direction": direction,
-                            "entry": entry,
-                            "stop_loss": stop_loss,
-                            "tp1": tp1,
-                            "tp2": tp2,
-                            "result": "TP1_BE",
-                            "r_multiple": tp1_profit,
-                        }
+                if breakeven_hit and tp2_hit:
+                    return {
+                        "result": "TP1+BE",
+                        "r": 0.375,
+                    }
 
-                    if hit_tp2:
+                if breakeven_hit:
+                    return {
+                        "result": "TP1+BE",
+                        "r": 0.375,
+                    }
 
-                        return {
-                            "direction": direction,
-                            "entry": entry,
-                            "stop_loss": stop_loss,
-                            "tp1": tp1,
-                            "tp2": tp2,
-                            "result": "TP2",
-                            "r_multiple": 1.125,
-                        }
+                if tp2_hit:
+                    return {
+                        "result": "TP2",
+                        "r": 1.125,
+                    }
 
-                return {
-                    "direction": direction,
-                    "entry": entry,
-                    "stop_loss": stop_loss,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "result": "OPEN",
-                    "r_multiple": tp1_profit,
-                }
-
-    # No outcome before historical data ended.
     return {
-        "direction": direction,
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "tp1": tp1,
-        "tp2": tp2,
         "result": "OPEN",
-        "r_multiple": 0.0,
+        "r": 0.0,
     }
 
 
-# ============================================================
-# BACKTEST ONE SYMBOL
-# ============================================================
+def run_period(df, start, end):
+    results = []
 
-def backtest_symbol(symbol):
+    i = start
 
-    print("\n" + "=" * 60)
-    print(f"BACKTESTING {symbol}")
-    print("=" * 60)
+    while i < end - 1:
 
-    df = get_historical_data(symbol)
+        signal = check_signal(df, i)
 
-    df = add_indicators(df)
-
-    trades = []
-
-    # Need enough history for EMA200.
-    for i in range(
-        201,
-        len(df) - 1,
-    ):
-
-        previous = df.iloc[i - 1]
-        current = df.iloc[i]
-
-        ema50 = current["ema50"]
-        ema200 = current["ema200"]
-        atr = current["atr"]
-        adx = current["adx"]
-
-        if any(
-            pd.isna(value)
-            for value in [
-                ema50,
-                ema200,
-                atr,
-                adx,
-            ]
-        ):
+        if signal is None:
+            i += 1
             continue
 
-        # ====================================================
-        # BUY LIMIT SETUP
-        # ====================================================
-
-        buy_setup = (
-            ema50 > ema200
-            and adx > 20
-            and previous["close"] > ema50
-            and current["low"] <= ema50
+        trade = backtest_trade(
+            df,
+            i + 1,
+            signal
         )
 
-        if buy_setup:
+        results.append(trade)
 
-            entry = ema50
+        # Move forward after the trade finishes.
+        # This prevents overlapping trades.
+        i += 1
 
-            stop_loss = (
-                entry - (2 * atr)
-            )
-
-            tp1 = (
-                entry + (1.5 * atr)
-            )
-
-            tp2 = (
-                entry + (3 * atr)
-            )
-
-            result = simulate_trade(
-                df,
-                i + 1,
-                entry,
-                stop_loss,
-                tp1,
-                tp2,
-                "BUY",
-            )
-
-            if result:
-
-                result["symbol"] = symbol
-
-                result["signal_time"] = (
-                    current["datetime"]
-                )
-
-                trades.append(result)
-
-        # ====================================================
-        # SELL LIMIT SETUP
-        # ====================================================
-
-        sell_setup = (
-            ema50 < ema200
-            and adx > 20
-            and previous["close"] < ema50
-            and current["high"] >= ema50
-        )
-
-        if sell_setup:
-
-            entry = ema50
-
-            stop_loss = (
-                entry + (2 * atr)
-            )
-
-            tp1 = (
-                entry - (1.5 * atr)
-            )
-
-            tp2 = (
-                entry - (3 * atr)
-            )
-
-            result = simulate_trade(
-                df,
-                i + 1,
-                entry,
-                stop_loss,
-                tp1,
-                tp2,
-                "SELL",
-            )
-
-            if result:
-
-                result["symbol"] = symbol
-
-                result["signal_time"] = (
-                    current["datetime"]
-                )
-
-                trades.append(result)
-
-    return pd.DataFrame(trades)
+    return results
 
 
-# ============================================================
-# SUMMARY
-# ============================================================
-
-def print_summary(results):
-
-    print("\n")
-    print("=" * 60)
-    print("APEX MARKET SIGNALS — REALISTIC BACKTEST")
-    print("=" * 60)
-
-    if results.empty:
-
-        print("No completed trades found.")
-
-        return
-
+def summarize(results):
     total = len(results)
 
-    full_losses = len(
-        results[
-            results["result"] == "SL"
-        ]
+    tp2 = sum(
+        1 for r in results
+        if r["result"] == "TP2"
     )
 
-    tp2_wins = len(
-        results[
-            results["result"] == "TP2"
-        ]
+    tp1_be = sum(
+        1 for r in results
+        if r["result"] == "TP1+BE"
     )
 
-    tp1_breakeven = len(
-        results[
-            results["result"] == "TP1_BE"
-        ]
+    sl = sum(
+        1 for r in results
+        if r["result"] == "SL"
     )
 
-    open_trades = len(
-        results[
-            results["result"] == "OPEN"
-        ]
+    open_trades = sum(
+        1 for r in results
+        if r["result"] == "OPEN"
     )
 
-    profitable_trades = (
-        tp2_wins + tp1_breakeven
-    )
+    resolved = total - open_trades
 
-    resolved_trades = (
-        total - open_trades
-    )
+    wins = tp2 + tp1_be
 
     win_rate = (
-        profitable_trades
-        / resolved_trades
-        * 100
-        if resolved_trades > 0
+        wins / resolved * 100
+        if resolved > 0
         else 0
     )
 
-    total_r = results[
-        "r_multiple"
-    ].sum()
+    total_r = sum(
+        r["r"] for r in results
+    )
 
     average_r = (
-        total_r / resolved_trades
-        if resolved_trades > 0
+        total_r / resolved
+        if resolved > 0
         else 0
     )
 
-    print(
-        f"Total trade signals: {total}"
-    )
+    return {
+        "total": total,
+        "tp2": tp2,
+        "tp1_be": tp1_be,
+        "sl": sl,
+        "open": open_trades,
+        "resolved": resolved,
+        "win_rate": win_rate,
+        "total_r": total_r,
+        "average_r": average_r,
+    }
 
-    print(
-        f"TP2 wins: {tp2_wins}"
-    )
 
-    print(
-        f"TP1 + breakeven: "
-        f"{tp1_breakeven}"
-    )
+def print_summary(title, summary):
+    print()
+    print("=" * 60)
+    print(title)
+    print("=" * 60)
 
-    print(
-        f"Full SL losses: "
-        f"{full_losses}"
-    )
-
-    print(
-        f"Open/unresolved: "
-        f"{open_trades}"
-    )
+    print(f"Total signals: {summary['total']}")
+    print(f"TP2 wins: {summary['tp2']}")
+    print(f"TP1 + breakeven: {summary['tp1_be']}")
+    print(f"Full SL losses: {summary['sl']}")
+    print(f"Open/unresolved: {summary['open']}")
 
     print(
         f"Resolved win rate: "
-        f"{win_rate:.2f}%"
+        f"{summary['win_rate']:.2f}%"
     )
 
     print(
         f"Total R: "
-        f"{total_r:.2f}R"
+        f"{summary['total_r']:.2f}R"
     )
 
     print(
         f"Average R per resolved trade: "
-        f"{average_r:.3f}R"
+        f"{summary['average_r']:.3f}R"
     )
 
-    print("\nResults by symbol:")
-
-    for symbol in SYMBOLS:
-
-        symbol_results = results[
-            results["symbol"] == symbol
-        ]
-
-        if symbol_results.empty:
-
-            print(
-                f"{symbol}: "
-                f"No completed trades"
-            )
-
-            continue
-
-        symbol_tp2 = len(
-            symbol_results[
-                symbol_results["result"]
-                == "TP2"
-            ]
-        )
-
-        symbol_tp1_be = len(
-            symbol_results[
-                symbol_results["result"]
-                == "TP1_BE"
-            ]
-        )
-
-        symbol_sl = len(
-            symbol_results[
-                symbol_results["result"]
-                == "SL"
-            ]
-        )
-
-        symbol_open = len(
-            symbol_results[
-                symbol_results["result"]
-                == "OPEN"
-            ]
-        )
-
-        symbol_r = symbol_results[
-            "r_multiple"
-        ].sum()
-
-        print(
-            f"{symbol}: "
-            f"{len(symbol_results)} trades | "
-            f"TP2: {symbol_tp2} | "
-            f"TP1+BE: {symbol_tp1_be} | "
-            f"SL: {symbol_sl} | "
-            f"Open: {symbol_open} | "
-            f"{symbol_r:.2f}R"
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
 
-    if not API_KEY:
+    print()
+    print("APEX MARKET SIGNALS")
+    print("OUT-OF-SAMPLE BACKTEST")
+    print("Trend Following Pullback Strategy")
+    print("Timeframe: 4H")
+    print("Development: 70%")
+    print("Out-of-sample: 30%")
+    print()
 
-        raise RuntimeError(
-            "TWELVE_DATA_API_KEY is missing."
-        )
-
-    all_results = []
+    all_development_results = []
+    all_oos_results = []
 
     for symbol in SYMBOLS:
 
-        try:
+        print(f"Downloading {symbol}...")
 
-            results = backtest_symbol(
-                symbol
-            )
+        df = get_data(symbol)
 
-            if not results.empty:
+        if df is None:
+            continue
 
-                all_results.append(
-                    results
-                )
-
-        except Exception as error:
-
+        if len(df) < 300:
             print(
-                f"ERROR while backtesting "
-                f"{symbol}: {error}"
+                f"{symbol}: Not enough candles "
+                f"({len(df)})"
             )
+            continue
 
-    if all_results:
+        df = calculate_indicators(df)
 
-        combined = pd.concat(
-            all_results,
-            ignore_index=True,
+        split_index = int(
+            len(df) * DEV_SPLIT
         )
 
-    else:
+        development = run_period(
+            df,
+            0,
+            split_index
+        )
 
-        combined = pd.DataFrame()
+        out_of_sample = run_period(
+            df,
+            split_index,
+            len(df)
+        )
 
-    print_summary(combined)
+        dev_summary = summarize(
+            development
+        )
+
+        oos_summary = summarize(
+            out_of_sample
+        )
+
+        all_development_results.extend(
+            development
+        )
+
+        all_oos_results.extend(
+            out_of_sample
+        )
+
+        print()
+        print(f"{symbol}")
+        print(
+            f"Development: "
+            f"{dev_summary['total']} trades | "
+            f"{dev_summary['total_r']:.2f}R"
+        )
+
+        print(
+            f"Out-of-sample: "
+            f"{oos_summary['total']} trades | "
+            f"{oos_summary['total_r']:.2f}R"
+        )
+
+    print_summary(
+        "COMBINED DEVELOPMENT RESULTS",
+        summarize(all_development_results)
+    )
+
+    print_summary(
+        "COMBINED OUT-OF-SAMPLE RESULTS",
+        summarize(all_oos_results)
+    )
+
+    print()
+    print("=" * 60)
+    print("TEST COMPLETE")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
