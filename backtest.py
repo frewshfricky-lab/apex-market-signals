@@ -17,7 +17,7 @@ OUTPUTSIZE = 5000
 DEVELOPMENT_RATIO = 0.70
 ADX_MIN = 20
 # ============================================================
-# STRATEGY RULES — DO NOT CHANGE
+# DATA PREPARATION
 # ============================================================
 def prepare_data(df):
     df = df.copy()
@@ -42,22 +42,22 @@ def prepare_data(df):
         window=14
     ).adx()
     return df
+# ============================================================
+# EXACT ORIGINAL SIGNAL RULES
+# ============================================================
 def check_signal(df, i):
     if i < 1:
         return None
     previous = df.iloc[i - 1]
     current = df.iloc[i]
-    if pd.isna(current["ema50"]):
+    if (
+        pd.isna(current["ema50"])
+        or pd.isna(current["ema200"])
+        or pd.isna(current["atr"])
+        or pd.isna(current["adx"])
+    ):
         return None
-    if pd.isna(current["ema200"]):
-        return None
-    if pd.isna(current["atr"]):
-        return None
-    if pd.isna(current["adx"]):
-        return None
-    # --------------------------------------------------------
     # BUY LIMIT
-    # --------------------------------------------------------
     if (
         current["ema50"] > current["ema200"]
         and current["adx"] > ADX_MIN
@@ -73,11 +73,9 @@ def check_signal(df, i):
             "tp1": entry + (1.5 * atr),
             "tp2": entry + (3 * atr),
             "signal_index": i,
-            "signal_adx": current["adx"],
+            "adx": current["adx"],
         }
-    # --------------------------------------------------------
     # SELL LIMIT
-    # --------------------------------------------------------
     if (
         current["ema50"] < current["ema200"]
         and current["adx"] > ADX_MIN
@@ -93,21 +91,20 @@ def check_signal(df, i):
             "tp1": entry - (1.5 * atr),
             "tp2": entry - (3 * atr),
             "signal_index": i,
-            "signal_adx": current["adx"],
+            "adx": current["adx"],
         }
     return None
 # ============================================================
-# TRADE SIMULATION
+# EXACT BASELINE TRADE SIMULATION
 # ============================================================
-def simulate_trade(df, signal, entry_index):
+def simulate_trade(df, signal, entry_index, end_index):
     direction = signal["direction"]
     entry = signal["entry"]
     sl = signal["sl"]
     tp1 = signal["tp1"]
     tp2 = signal["tp2"]
-    risk = abs(entry - sl)
     tp1_hit = False
-    for j in range(entry_index, len(df)):
+    for j in range(entry_index, end_index):
         candle = df.iloc[j]
         high = candle["high"]
         low = candle["low"]
@@ -117,10 +114,8 @@ def simulate_trade(df, signal, entry_index):
         if not tp1_hit:
             if direction == "BUY":
                 sl_hit = low <= sl
-                tp1_reached = high >= tp1
-                # Conservative same-candle handling:
-                # SL wins if both are touched.
-                if sl_hit and tp1_reached:
+                tp1_hit_now = high >= tp1
+                if sl_hit and tp1_hit_now:
                     return {
                         "result": "SL",
                         "r": -1.0,
@@ -132,19 +127,12 @@ def simulate_trade(df, signal, entry_index):
                         "r": -1.0,
                         "exit_index": j,
                     }
-                if tp1_reached:
+                if tp1_hit_now:
                     tp1_hit = True
-                    # Remaining 50% moves to breakeven.
-                    # From TP1:
-                    # first half = +0.75R x 50% = +0.375R
-                    #
-                    # Continue looking for TP2 or BE.
             else:
                 sl_hit = high >= sl
-                tp1_reached = low <= tp1
-                # Conservative same-candle handling:
-                # SL wins if both are touched.
-                if sl_hit and tp1_reached:
+                tp1_hit_now = low <= tp1
+                if sl_hit and tp1_hit_now:
                     return {
                         "result": "SL",
                         "r": -1.0,
@@ -156,53 +144,49 @@ def simulate_trade(df, signal, entry_index):
                         "r": -1.0,
                         "exit_index": j,
                     }
-                if tp1_reached:
+                if tp1_hit_now:
                     tp1_hit = True
         # ----------------------------------------------------
         # AFTER TP1
         # ----------------------------------------------------
         if tp1_hit:
             if direction == "BUY":
-                breakeven_hit = low <= entry
-                tp2_reached = high >= tp2
-                # Conservative same-candle handling:
-                # BE wins if both are touched.
-                if breakeven_hit and tp2_reached:
+                be_hit = low <= entry
+                tp2_hit = high >= tp2
+                if be_hit and tp2_hit:
                     return {
                         "result": "TP1+BE",
                         "r": 0.375,
                         "exit_index": j,
                     }
-                if breakeven_hit:
+                if be_hit:
                     return {
                         "result": "TP1+BE",
                         "r": 0.375,
                         "exit_index": j,
                     }
-                if tp2_reached:
+                if tp2_hit:
                     return {
                         "result": "TP2",
                         "r": 1.125,
                         "exit_index": j,
                     }
             else:
-                breakeven_hit = high >= entry
-                tp2_reached = low <= tp2
-                # Conservative same-candle handling:
-                # BE wins if both are touched.
-                if breakeven_hit and tp2_reached:
+                be_hit = high >= entry
+                tp2_hit = low <= tp2
+                if be_hit and tp2_hit:
                     return {
                         "result": "TP1+BE",
                         "r": 0.375,
                         "exit_index": j,
                     }
-                if breakeven_hit:
+                if be_hit:
                     return {
                         "result": "TP1+BE",
                         "r": 0.375,
                         "exit_index": j,
                     }
-                if tp2_reached:
+                if tp2_hit:
                     return {
                         "result": "TP2",
                         "r": 1.125,
@@ -210,7 +194,7 @@ def simulate_trade(df, signal, entry_index):
                     }
     return None
 # ============================================================
-# PERIOD TEST
+# BASELINE PERIOD TEST + DIAGNOSTICS
 # ============================================================
 def run_period(df, start_index, end_index):
     results = []
@@ -221,114 +205,103 @@ def run_period(df, start_index, end_index):
             i += 1
             continue
         signal_index = i
+        # ----------------------------------------------------
+        # ENTRY MUST OCCUR AFTER SIGNAL CANDLE
+        # ----------------------------------------------------
         entry_index = None
-        entry_delay = None
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # LIMIT ENTRY CAN ONLY FILL AFTER SIGNAL CANDLE
-        # ----------------------------------------------------
         for j in range(signal_index + 1, end_index):
             candle = df.iloc[j]
             if signal["direction"] == "BUY":
                 if candle["low"] <= signal["entry"]:
                     entry_index = j
-                    entry_delay = j - signal_index
                     break
             else:
                 if candle["high"] >= signal["entry"]:
                     entry_index = j
-                    entry_delay = j - signal_index
                     break
         # ----------------------------------------------------
         # NO ENTRY
         # ----------------------------------------------------
         if entry_index is None:
             results.append({
-                "signal_index": signal_index,
                 "direction": signal["direction"],
-                "adx": signal["signal_adx"],
+                "adx": signal["adx"],
                 "entry_delay": None,
-                "no_entry": True,
                 "result": "NO_ENTRY",
                 "r": 0.0,
             })
             i += 1
             continue
+        entry_delay = entry_index - signal_index
         # ----------------------------------------------------
-        # SIMULATE TRADE
+        # TRADE
         # ----------------------------------------------------
         trade = simulate_trade(
             df,
             signal,
-            entry_index
+            entry_index,
+            end_index
         )
         if trade is None:
             results.append({
-                "signal_index": signal_index,
                 "direction": signal["direction"],
-                "adx": signal["signal_adx"],
+                "adx": signal["adx"],
                 "entry_delay": entry_delay,
-                "no_entry": False,
                 "result": "OPEN",
                 "r": 0.0,
             })
-            break
+            i = end_index
+            continue
         results.append({
-            "signal_index": signal_index,
             "direction": signal["direction"],
-            "adx": signal["signal_adx"],
+            "adx": signal["adx"],
             "entry_delay": entry_delay,
-            "no_entry": False,
             "result": trade["result"],
             "r": trade["r"],
         })
-        # ----------------------------------------------------
         # NO OVERLAPPING TRADES
-        # ----------------------------------------------------
         i = trade["exit_index"] + 1
     return results
 # ============================================================
 # SUMMARY
 # ============================================================
-def summarize(results):
-    signals = len(results)
-    no_entry = sum(
-        1 for x in results
-        if x["result"] == "NO_ENTRY"
-    )
+def summary(results):
     tp2 = sum(
-        1 for x in results
-        if x["result"] == "TP2"
+        x["result"] == "TP2"
+        for x in results
     )
-    tp1_be = sum(
-        1 for x in results
-        if x["result"] == "TP1+BE"
+    tp1be = sum(
+        x["result"] == "TP1+BE"
+        for x in results
     )
     sl = sum(
-        1 for x in results
-        if x["result"] == "SL"
+        x["result"] == "SL"
+        for x in results
     )
-    resolved = tp2 + tp1_be + sl
+    no_entry = sum(
+        x["result"] == "NO_ENTRY"
+        for x in results
+    )
+    resolved = tp2 + tp1be + sl
     total_r = sum(
         x["r"]
         for x in results
-        if x["result"] in ["TP2", "TP1+BE", "SL"]
     )
     win_rate = (
-        ((tp2 + tp1_be) / resolved) * 100
-        if resolved > 0
+        (tp2 + tp1be) / resolved * 100
+        if resolved
         else 0
     )
     avg_r = (
         total_r / resolved
-        if resolved > 0
+        if resolved
         else 0
     )
     return {
-        "signals": signals,
+        "signals": len(results),
         "no_entry": no_entry,
         "tp2": tp2,
-        "tp1_be": tp1_be,
+        "tp1be": tp1be,
         "sl": sl,
         "resolved": resolved,
         "win_rate": win_rate,
@@ -336,57 +309,121 @@ def summarize(results):
         "avg_r": avg_r,
     }
 # ============================================================
-# ENTRY DELAY BREAKDOWN
+# ADX BUCKET
 # ============================================================
-def print_entry_delay_breakdown(results):
-    resolved_or_open = [
-        x for x in results
-        if x["entry_delay"] is not None
-    ]
+def adx_bucket(adx):
+    if adx < 25:
+        return "20-25"
+    if adx < 30:
+        return "25-30"
+    if adx < 40:
+        return "30-40"
+    return "40+"
+# ============================================================
+# DIAGNOSTIC TABLES
+# ============================================================
+def print_direction_breakdown(all_results):
     print()
     print("=" * 60)
-    print("ENTRY FILL DELAY — OUT-OF-SAMPLE")
+    print("DIRECTION BREAKDOWN — OUT-OF-SAMPLE")
     print("=" * 60)
-    if not resolved_or_open:
-        print("No entries were filled.")
-        return
-    delay_counts = {}
-    for trade in resolved_or_open:
-        delay = trade["entry_delay"]
-        if delay not in delay_counts:
-            delay_counts[delay] = 0
-        delay_counts[delay] += 1
-    for delay in sorted(delay_counts):
-        count = delay_counts[delay]
+    for symbol, results in all_results.items():
+        print()
+        print(symbol)
+        for direction in ["BUY", "SELL"]:
+            group = [
+                x for x in results
+                if x["direction"] == direction
+                and x["result"] in [
+                    "TP2",
+                    "TP1+BE",
+                    "SL"
+                ]
+            ]
+            if not group:
+                print(
+                    f"{direction:<5} | Trades: 0"
+                )
+                continue
+            tp2 = sum(
+                x["result"] == "TP2"
+                for x in group
+            )
+            tp1be = sum(
+                x["result"] == "TP1+BE"
+                for x in group
+            )
+            sl = sum(
+                x["result"] == "SL"
+                for x in group
+            )
+            total_r = sum(
+                x["r"]
+                for x in group
+            )
+            wins = tp2 + tp1be
+            win_rate = wins / len(group) * 100
+            print(
+                f"{direction:<5} | "
+                f"Trades: {len(group)} | "
+                f"TP2: {tp2} | "
+                f"TP1+BE: {tp1be} | "
+                f"SL: {sl} | "
+                f"Win: {win_rate:.2f}% | "
+                f"R: {total_r:.2f}"
+            )
+def print_adx_breakdown(all_results):
+    print()
+    print("=" * 60)
+    print("ADX BREAKDOWN — OUT-OF-SAMPLE")
+    print("=" * 60)
+    buckets = [
+        "20-25",
+        "25-30",
+        "30-40",
+        "40+",
+    ]
+    for bucket in buckets:
+        group = []
+        for results in all_results.values():
+            for x in results:
+                if x["result"] not in [
+                    "TP2",
+                    "TP1+BE",
+                    "SL"
+                ]:
+                    continue
+                if adx_bucket(x["adx"]) == bucket:
+                    group.append(x)
+        if not group:
+            print(
+                f"ADX {bucket}: 0 trades"
+            )
+            continue
+        wins = sum(
+            x["result"] in [
+                "TP2",
+                "TP1+BE"
+            ]
+            for x in group
+        )
+        total_r = sum(
+            x["r"]
+            for x in group
+        )
+        win_rate = (
+            wins / len(group) * 100
+        )
         print(
-            f"Entry after {delay} candle(s): {count} trades"
+            f"ADX {bucket}: "
+            f"{len(group)} trades | "
+            f"Win rate: {win_rate:.2f}% | "
+            f"R: {total_r:.2f}"
         )
-    print()
-    print("Grouped:")
-    
-    groups = [
-        ("1 candle", lambda x: x == 1),
-        ("2 candles", lambda x: x == 2),
-        ("3 candles", lambda x: x == 3),
-        ("4-5 candles", lambda x: 4 <= x <= 5),
-        ("6-10 candles", lambda x: 6 <= x <= 10),
-        ("11-20 candles", lambda x: 11 <= x <= 20),
-        ("21+ candles", lambda x: x >= 21),
-    ]
-    for label, condition in groups:
-        count = sum(
-            1
-            for x in resolved_or_open
-            if condition(x["entry_delay"])
-        )
-        print(f"{label}: {count} trades")
-# ============================================================
-# ENTRY DELAY PERFORMANCE
-# ============================================================
-def print_entry_delay_performance(results):
+def print_entry_delay_breakdown(all_results):
     print()
     print("=" * 60)
-    print("ENTRY DELAY PERFORMANCE — OUT-OF-SAMPLE")
+    print("ENTRY DELAY BREAKDOWN — OUT-OF-SAMPLE")
     print("=" * 60)
     groups = [
         ("1 candle", lambda x: x == 1),
@@ -397,50 +434,47 @@ def print_entry_delay_performance(results):
         ("11-20 candles", lambda x: 11 <= x <= 20),
         ("21+ candles", lambda x: x >= 21),
     ]
+    combined = []
+    for results in all_results.values():
+        combined.extend(results)
     for label, condition in groups:
         group = [
-            x for x in results
+            x for x in combined
             if x["entry_delay"] is not None
             and condition(x["entry_delay"])
-            and x["result"] in ["TP2", "TP1+BE", "SL"]
+            and x["result"] in [
+                "TP2",
+                "TP1+BE",
+                "SL"
+            ]
         ]
         if not group:
             print(
                 f"{label}: 0 resolved trades"
             )
             continue
-        tp2 = sum(
-            1 for x in group
-            if x["result"] == "TP2"
-        )
-        tp1_be = sum(
-            1 for x in group
-            if x["result"] == "TP1+BE"
-        )
-        sl = sum(
-            1 for x in group
-            if x["result"] == "SL"
-        )
-        resolved = len(group)
-        wins = tp2 + tp1_be
-        win_rate = (
-            wins / resolved * 100
+        wins = sum(
+            x["result"] in [
+                "TP2",
+                "TP1+BE"
+            ]
+            for x in group
         )
         total_r = sum(
-            x["r"] for x in group
+            x["r"]
+            for x in group
         )
-        avg_r = (
-            total_r / resolved
+        win_rate = (
+            wins / len(group) * 100
         )
         print(
             f"{label}: "
-            f"{resolved} trades | "
+            f"{len(group)} trades | "
             f"Win rate: {win_rate:.2f}% | "
-            f"R: {total_r:.2f} | "
-            f"Avg R: {avg_r:.3f}"
+            f"R: {total_r:.2f}"
         )
 # ============================================================
-# DATA DOWNLOAD
+# DOWNLOAD DATA
 # ============================================================
 def download_data(symbol):
     url = "https://api.twelvedata.com/time_series"
@@ -461,7 +495,9 @@ def download_data(symbol):
         print("API ERROR:")
         print(data)
         return None
-    df = pd.DataFrame(data["values"])
+    df = pd.DataFrame(
+        data["values"]
+    )
     df["datetime"] = pd.to_datetime(
         df["datetime"]
     )
@@ -472,7 +508,7 @@ def download_data(symbol):
         "open",
         "high",
         "low",
-        "close",
+        "close"
     ]:
         df[column] = pd.to_numeric(
             df[column],
@@ -484,17 +520,19 @@ def download_data(symbol):
             "open",
             "high",
             "low",
-            "close",
+            "close"
         ]
     ]
-    df = df.dropna().reset_index(drop=True)
+    df = df.dropna().reset_index(
+        drop=True
+    )
     return df
 # ============================================================
 # MAIN
 # ============================================================
 print()
 print("APEX MARKET SIGNALS")
-print("ENTRY-FILL TIMING DIAGNOSTIC")
+print("BASELINE-PRESERVING DIAGNOSTIC")
 print("Trend Following Pullback Strategy")
 print("Timeframe: 4H")
 print(f"Historical candles: {OUTPUTSIZE}")
@@ -502,10 +540,12 @@ print("Development: 70%")
 print("Out-of-sample: 30%")
 print()
 print("NO STRATEGY RULES ARE BEING CHANGED.")
-print("TRADES CANNOT OVERLAP.")
-print("THIS TEST MEASURES ENTRY-FILL DELAY.")
+print("NO OVERLAPPING TRADES.")
+print("BASELINE TRADE MECHANICS PRESERVED.")
 print()
-all_oos_results = []
+combined_development = []
+combined_oos = []
+oos_by_symbol = {}
 for symbol in SYMBOLS:
     print(f"Downloading {symbol}...")
     df = download_data(symbol)
@@ -525,73 +565,120 @@ for symbol in SYMBOLS:
         split_index,
         len(df)
     )
-    development_summary = summarize(
+    combined_development.extend(
         development_results
     )
-    oos_summary = summarize(
+    combined_oos.extend(
         oos_results
     )
-    all_oos_results.extend(oos_results)
+    oos_by_symbol[symbol] = oos_results
+    dev = summary(
+        development_results
+    )
+    oos = summary(
+        oos_results
+    )
     print()
     print(symbol)
     print(
         f"Development: "
-        f"{development_summary['signals']} signals | "
-        f"{development_summary['total_r']:.2f}R"
+        f"{dev['signals']} signals | "
+        f"{dev['total_r']:.2f}R"
     )
     print(
         f"Out-of-sample: "
-        f"{oos_summary['signals']} signals | "
-        f"{oos_summary['total_r']:.2f}R"
+        f"{oos['signals']} signals | "
+        f"{oos['total_r']:.2f}R"
     )
 # ============================================================
-# COMBINED OOS ENTRY DELAY DIAGNOSTICS
+# COMBINED DEVELOPMENT
 # ============================================================
-print_entry_delay_breakdown(
-    all_oos_results
-)
-print_entry_delay_performance(
-    all_oos_results
-)
-# ============================================================
-# FINAL OOS SUMMARY
-# ============================================================
-summary = summarize(
-    all_oos_results
+dev = summary(
+    combined_development
 )
 print()
 print("=" * 60)
-print("CURRENT OUT-OF-SAMPLE BASELINE")
+print("COMBINED DEVELOPMENT RESULTS")
 print("=" * 60)
 print(
-    f"Signals generated: {summary['signals']}"
+    f"Signals generated: {dev['signals']}"
 )
 print(
-    f"No-entry signals: {summary['no_entry']}"
+    f"No-entry signals: {dev['no_entry']}"
 )
 print(
-    f"TP2 wins: {summary['tp2']}"
+    f"TP2 wins: {dev['tp2']}"
 )
 print(
-    f"TP1 + breakeven: {summary['tp1_be']}"
+    f"TP1 + breakeven: {dev['tp1be']}"
 )
 print(
-    f"Full SL losses: {summary['sl']}"
+    f"Full SL losses: {dev['sl']}"
 )
 print(
-    f"Resolved trades: {summary['resolved']}"
+    f"Resolved trades: {dev['resolved']}"
 )
 print(
-    f"Resolved win rate: {summary['win_rate']:.2f}%"
+    f"Resolved win rate: {dev['win_rate']:.2f}%"
 )
 print(
-    f"Total R: {summary['total_r']:.2f}R"
+    f"Total R: {dev['total_r']:.2f}R"
 )
 print(
     f"Average R per resolved trade: "
-    f"{summary['avg_r']:.3f}R"
+    f"{dev['avg_r']:.3f}R"
+)
+# ============================================================
+# COMBINED OOS
+# ============================================================
+oos = summary(
+    combined_oos
 )
 print()
 print("=" * 60)
-print("ENTRY-FILL TIMING DIAGNOSTIC COMPLETE")
+print("COMBINED OUT-OF-SAMPLE RESULTS")
+print("=" * 60)
+print(
+    f"Signals generated: {oos['signals']}"
+)
+print(
+    f"No-entry signals: {oos['no_entry']}"
+)
+print(
+    f"TP2 wins: {oos['tp2']}"
+)
+print(
+    f"TP1 + breakeven: {oos['tp1be']}"
+)
+print(
+    f"Full SL losses: {oos['sl']}"
+)
+print(
+    f"Resolved trades: {oos['resolved']}"
+)
+print(
+    f"Resolved win rate: {oos['win_rate']:.2f}%"
+)
+print(
+    f"Total R: {oos['total_r']:.2f}R"
+)
+print(
+    f"Average R per resolved trade: "
+    f"{oos['avg_r']:.3f}R"
+)
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+print_direction_breakdown(
+    oos_by_symbol
+)
+print_adx_breakdown(
+    oos_by_symbol
+)
+print_entry_delay_breakdown(
+    oos_by_symbol
+)
+print()
+print("=" * 60)
+print("BASELINE-PRESERVING DIAGNOSTIC COMPLETE")
 print("=" * 60)
